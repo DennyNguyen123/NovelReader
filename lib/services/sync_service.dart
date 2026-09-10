@@ -190,10 +190,15 @@ class SyncService {
 
   Future<SyncResult> downloadVirtualBook(String bookUuid) async {
     _updateBookSyncStatus(bookUuid, 'syncing');
-    final docDir = (await PathHelper.getAppDirectory()).path;
-    final result = await rust_sync.downloadVirtualBook(bookUuid: bookUuid, documentsDir: docDir);
-    _updateBookSyncStatus(bookUuid, result.success ? 'success' : 'error');
-    return result;
+    try {
+      final docDir = (await PathHelper.getAppDirectory()).path;
+      final result = await rust_sync.downloadVirtualBook(bookUuid: bookUuid, documentsDir: docDir);
+      _updateBookSyncStatus(bookUuid, result.success ? 'success' : 'error');
+      return result;
+    } catch (e) {
+      _updateBookSyncStatus(bookUuid, 'error');
+      return SyncResult(success: false, message: 'Download failed: $e', localChanged: false);
+    }
   }
 
   Future<List<Map<String, dynamic>>> getSyncHistory() async {

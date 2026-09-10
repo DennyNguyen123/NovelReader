@@ -228,7 +228,7 @@ AAAEAgc0dk4OFB1cmOcwgm7VAz4TIZ2A0x5DPA/+nYkfE1cK+1D2F0fMPkYBKQ7VKgZAyQ
           }
 
           return shelf.Response.ok(
-            jsonEncode({'status': 'ok', 'message': 'Config received successfully'}),
+            jsonEncode({'success': true, 'status': 'ok', 'message': 'Config received successfully'}),
             headers: {'content-type': 'application/json', ..._corsHeaders()},
           );
         } catch (e) {

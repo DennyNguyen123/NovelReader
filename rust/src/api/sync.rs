@@ -137,7 +137,10 @@ impl WebDavClient {
             .await
             .map_err(|e| e.to_string())?;
             
-        Ok(res.status().is_success())
+        if !res.status().is_success() {
+            return Err(format!("Upload failed for '{}' with status: {}", remote_path, res.status()));
+        }
+        Ok(true)
     }
 
     pub async fn download_bytes(&self, remote_path: &str) -> Result<Vec<u8>, String> {
@@ -150,10 +153,13 @@ impl WebDavClient {
             .map_err(|e| e.to_string())?;
             
         if !res.status().is_success() {
-            return Err(format!("Download failed with status: {}", res.status()));
+            return Err(format!("Download failed for '{}' with status: {}", remote_path, res.status()));
         }
         
         let bytes = res.bytes().await.map_err(|e| e.to_string())?;
+        if bytes.is_empty() {
+            return Err(format!("File '{}' on WebDAV is empty (0 bytes)", remote_path));
+        }
         Ok(bytes.to_vec())
     }
 
@@ -211,7 +217,7 @@ impl WebDavClient {
         Ok(res.status().is_success())
     }
 
-    pub async fn file_exists(&self, remote_path: &str) -> Result<bool, String> {
+    pub async fn get_file_size(&self, remote_path: &str) -> Result<Option<i64>, String> {
         let url = format!("{}/{}", self.base_url.trim_end_matches('/'), remote_path.trim_start_matches('/'));
         let propfind = Method::from_bytes(b"PROPFIND").map_err(|e| e.to_string())?;
         
@@ -222,7 +228,27 @@ impl WebDavClient {
             .await
             .map_err(|e| e.to_string())?;
             
-        Ok(res.status().is_success() || res.status().as_u16() == 207)
+        if !res.status().is_success() && res.status().as_u16() != 207 {
+            return Ok(None);
+        }
+
+        let xml_text = res.text().await.map_err(|e| e.to_string())?;
+        let files = parse_webdav_xml(&xml_text)?;
+        if let Some(f) = files.into_iter().next() {
+            Ok(Some(f.size))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn file_exists(&self, remote_path: &str) -> Result<bool, String> {
+        let size = self.get_file_size(remote_path).await?;
+        Ok(size.is_some())
+    }
+
+    pub async fn file_exists_and_non_empty(&self, remote_path: &str) -> Result<bool, String> {
+        let size = self.get_file_size(remote_path).await?;
+        Ok(size.map(|s| s > 0).unwrap_or(false))
     }
 }
 
@@ -486,6 +512,13 @@ pub async fn export_and_upload_book(book_uuid: String) -> Result<bool, String> {
     let compressed_bytes = encoder.finish().map_err(|e| e.to_string())?;
 
     let client = get_or_init_client().await?;
+    let _ = client.mkdir("/AudireReader").await;
+    let _ = client.mkdir("/AudireReader/books").await;
+    let _ = client.mkdir("/AudireReader/covers").await;
+    let _ = client.mkdir("/AudireReader/progress").await;
+    let _ = client.mkdir("/AudireReader/bookmarks").await;
+    let _ = client.mkdir("/AudireReader/highlights").await;
+
     let remote_path = format!("/AudireReader/books/{}.json.gz", book_uuid);
     client.upload_bytes(&remote_path, compressed_bytes).await?;
 
@@ -504,25 +537,55 @@ pub async fn export_and_upload_book(book_uuid: String) -> Result<bool, String> {
 pub async fn download_and_import_book(book_uuid: String, documents_dir: String) -> Result<Book, String> {
     let client = get_or_init_client().await?;
 
-    let remote_path = format!("/AudireReader/books/{}.json.gz", book_uuid);
-    let compressed_bytes = client.download_bytes(&remote_path).await?;
+    let possible_paths = [
+        format!("/AudireReader/books/{}.json.gz", book_uuid),
+        format!("/AudireReader/books/{}.json", book_uuid),
+        format!("/NovelReader/books/{}.json.gz", book_uuid),
+        format!("/NovelReader/books/{}.json", book_uuid),
+    ];
 
-    let mut decoder = GzDecoder::new(&compressed_bytes[..]);
-    let mut json_bytes = Vec::new();
-    std::io::Read::read_to_end(&mut decoder, &mut json_bytes).map_err(|e| e.to_string())?;
+    let mut downloaded_bytes = None;
+    for remote_path in &possible_paths {
+        if let Ok(bytes) = client.download_bytes(remote_path).await {
+            if !bytes.is_empty() {
+                downloaded_bytes = Some(bytes);
+                break;
+            }
+        }
+    }
 
-    let payload: SyncBookPayload = serde_json::from_slice(&json_bytes).map_err(|e| e.to_string())?;
+    let bytes = downloaded_bytes.ok_or_else(|| {
+        format!("File nội dung truyện '{}' trên WebDAV bị thiếu hoặc rỗng (0 bytes). Vui lòng mở thiết bị có truyện và bấm 'Đồng bộ' (hoặc 'Đẩy lên Cloud') để tải lại nội dung.", book_uuid)
+    })?;
+
+    let json_bytes = if bytes.starts_with(&[0x1f, 0x8b]) {
+        let mut decoder = GzDecoder::new(&bytes[..]);
+        let mut decompressed = Vec::new();
+        std::io::Read::read_to_end(&mut decoder, &mut decompressed)
+            .map_err(|e| format!("Failed to decompress gzip book data: {}", e))?;
+        decompressed
+    } else {
+        bytes
+    };
+
+    if json_bytes.is_empty() {
+        return Err(format!("Decoded JSON data for book '{}' is empty (0 bytes)", book_uuid));
+    }
+
+    let payload: SyncBookPayload = serde_json::from_slice(&json_bytes)
+        .map_err(|e| format!("Failed to parse book JSON ({} bytes received): {}", json_bytes.len(), e))?;
 
     let mut cover_path = None;
     if let Some(ref ext) = payload.cover_extension {
-        let remote_cover = format!("/AudireReader/covers/{}{}", book_uuid, ext);
+        let ext_with_dot = if ext.starts_with('.') { ext.clone() } else { format!(".{}", ext) };
+        let remote_cover = format!("/AudireReader/covers/{}{}", book_uuid, ext_with_dot);
         if let Ok(exists) = client.file_exists(&remote_cover).await {
             if exists {
                 let local_cover_dir = Path::new(&documents_dir).join("covers");
                 if !local_cover_dir.exists() {
                     let _ = std::fs::create_dir_all(&local_cover_dir);
                 }
-                let local_cover_path = local_cover_dir.join(format!("{}{}", book_uuid, ext));
+                let local_cover_path = local_cover_dir.join(format!("{}{}", book_uuid, ext_with_dot));
                 let local_cover_str = local_cover_path.to_string_lossy().to_string();
                 if client.download_file(&remote_cover, &local_cover_str).await.is_ok() {
                     cover_path = Some(local_cover_str);
@@ -967,7 +1030,10 @@ pub async fn sync_library(documents_dir: Option<String>) -> Result<SyncResult, S
                 continue;
             }
 
-            if !cloud_uuids.contains(&local_book.uuid) {
+            let remote_file = format!("/AudireReader/books/{}.json.gz", local_book.uuid);
+            let file_exists_on_cloud = client.file_exists_and_non_empty(&remote_file).await.unwrap_or(false);
+
+            if !cloud_uuids.contains(&local_book.uuid) || !file_exists_on_cloud {
                 emit_sync_event(SyncProgressEvent {
                     event_type: "bookStatus".to_string(),
                     book_uuid: Some(local_book.uuid.clone()),
@@ -979,16 +1045,18 @@ pub async fn sync_library(documents_dir: Option<String>) -> Result<SyncResult, S
 
                 if export_and_upload_book(local_book.uuid.clone()).await.unwrap_or(false) {
                     let ext = local_book.cover_path.as_ref().and_then(|p| Path::new(p).extension().and_then(|e| e.to_str()).map(|e| format!(".{}", e)));
-                    cloud_sync_data.books.push(SyncDataBookItem {
-                        uuid: local_book.uuid.clone(),
-                        title: local_book.title.clone(),
-                        author: local_book.author.clone(),
-                        total_chapters: local_book.total_chapters,
-                        date_added: chrono::DateTime::from_timestamp_millis(local_book.date_added).map(|dt| dt.to_rfc3339()).unwrap_or_else(|| Utc::now().to_rfc3339()),
-                        cover_extension: ext,
-                        has_cover: local_book.cover_path.is_some(),
-                    });
-                    cloud_uuids.insert(local_book.uuid.clone());
+                    if !cloud_uuids.contains(&local_book.uuid) {
+                        cloud_sync_data.books.push(SyncDataBookItem {
+                            uuid: local_book.uuid.clone(),
+                            title: local_book.title.clone(),
+                            author: local_book.author.clone(),
+                            total_chapters: local_book.total_chapters,
+                            date_added: chrono::DateTime::from_timestamp_millis(local_book.date_added).map(|dt| dt.to_rfc3339()).unwrap_or_else(|| Utc::now().to_rfc3339()),
+                            cover_extension: ext,
+                            has_cover: local_book.cover_path.is_some(),
+                        });
+                        cloud_uuids.insert(local_book.uuid.clone());
+                    }
                 }
             }
         }
@@ -1198,6 +1266,54 @@ pub async fn force_push_book(book_uuid: String) -> Result<SyncResult, String> {
     let _ = sync_book_progress(book_uuid.clone()).await;
     let _ = sync_book_bookmarks(book_uuid.clone()).await;
     let _ = sync_book_highlights(book_uuid.clone()).await;
+
+    // Ensure sync_data.json includes this book
+    if let Ok(client) = get_or_init_client().await {
+        if let Ok(Some(local_book)) = crate::api::database::get_book_by_uuid(book_uuid.clone()) {
+            let mut sync_data = if client.file_exists("/AudireReader/sync_data.json").await.unwrap_or(false) {
+                if let Ok(bytes) = client.download_bytes("/AudireReader/sync_data.json").await {
+                    serde_json::from_slice::<SyncDataFile>(&bytes).unwrap_or_else(|_| SyncDataFile {
+                        version: 1,
+                        last_sync_time: Utc::now().to_rfc3339(),
+                        books: vec![],
+                        deleted: vec![],
+                    })
+                } else {
+                    SyncDataFile {
+                        version: 1,
+                        last_sync_time: Utc::now().to_rfc3339(),
+                        books: vec![],
+                        deleted: vec![],
+                    }
+                }
+            } else {
+                SyncDataFile {
+                    version: 1,
+                    last_sync_time: Utc::now().to_rfc3339(),
+                    books: vec![],
+                    deleted: vec![],
+                }
+            };
+
+            if !sync_data.books.iter().any(|b| b.uuid == book_uuid) {
+                let ext = local_book.cover_path.as_ref().and_then(|p| Path::new(p).extension().and_then(|e| e.to_str()).map(|e| format!(".{}", e)));
+                sync_data.books.push(SyncDataBookItem {
+                    uuid: local_book.uuid.clone(),
+                    title: local_book.title.clone(),
+                    author: local_book.author.clone(),
+                    total_chapters: local_book.total_chapters,
+                    date_added: chrono::DateTime::from_timestamp_millis(local_book.date_added).map(|dt| dt.to_rfc3339()).unwrap_or_else(|| Utc::now().to_rfc3339()),
+                    cover_extension: ext,
+                    has_cover: local_book.cover_path.is_some(),
+                });
+                sync_data.last_sync_time = Utc::now().to_rfc3339();
+                if let Ok(sync_bytes) = serde_json::to_vec(&sync_data) {
+                    let _ = client.upload_bytes("/AudireReader/sync_data.json", sync_bytes).await;
+                }
+            }
+        }
+    }
+
     Ok(SyncResult {
         success: ok,
         message: format!("Pushed book {} to cloud", book_uuid),
@@ -1285,6 +1401,83 @@ pub async fn download_virtual_book(book_uuid: String, documents_dir: String) -> 
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn test_optional_live_webdav() {
+        let url = std::env::var("WEBDAV_TEST_URL").unwrap_or_default();
+        let user = std::env::var("WEBDAV_TEST_USER").unwrap_or_default();
+        let pass = std::env::var("WEBDAV_TEST_PASS").unwrap_or_default();
+
+        if url.is_empty() || user.is_empty() {
+            return; // Skip if environment variables are not provided
+        }
+
+        let client = WebDavClient::new(&url, &user, &pass).expect("Failed to create WebDavClient");
+        let connected = client.test_connection().await;
+        assert!(connected.unwrap_or(false), "Failed to connect to WebDAV");
+    }
+
+    #[test]
+    fn test_webdav_client_url_normalization() {
+        let c1 = WebDavClient::new("app.koofr.net/dav/Koofr", "user", "pass").unwrap();
+        assert_eq!(c1.base_url, "https://app.koofr.net/dav/Koofr");
+
+        let c2 = WebDavClient::new("http://my-nas.local:5005/webdav/", "user", "pass").unwrap();
+        assert_eq!(c2.base_url, "http://my-nas.local:5005/webdav/");
+    }
+
+    #[test]
+    fn test_webdav_xml_parsing() {
+        let sample_xml = r#"<?xml version="1.0" encoding="utf-8"?>
+        <d:multistatus xmlns:d="DAV:">
+            <d:response>
+                <d:href>/dav/Koofr/AudireReader/books/</d:href>
+                <d:propstat>
+                    <d:prop>
+                        <d:displayname>books</d:displayname>
+                        <d:resourcetype><d:collection/></d:resourcetype>
+                        <d:getcontentlength>0</d:getcontentlength>
+                    </d:prop>
+                    <d:status>HTTP/1.1 200 OK</d:status>
+                </d:propstat>
+            </d:response>
+            <d:response>
+                <d:href>/dav/Koofr/AudireReader/books/my_book.json.gz</d:href>
+                <d:propstat>
+                    <d:prop>
+                        <d:displayname>my_book.json.gz</d:displayname>
+                        <d:resourcetype/>
+                        <d:getcontentlength>123456</d:getcontentlength>
+                        <d:getlastmodified>Wed, 19 Aug 2026 06:51:09 GMT</d:getlastmodified>
+                    </d:prop>
+                    <d:status>HTTP/1.1 200 OK</d:status>
+                </d:propstat>
+            </d:response>
+        </d:multistatus>"#;
+
+        let files = parse_webdav_xml(sample_xml).expect("Should parse XML");
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].name, "books");
+        assert_eq!(files[0].is_dir, true);
+        assert_eq!(files[1].name, "my_book.json.gz");
+        assert_eq!(files[1].is_dir, false);
+        assert_eq!(files[1].size, 123456);
+    }
+
+    #[test]
+    fn test_gzip_roundtrip() {
+        let original_data = b"Hello, AudireReader WebDAV synchronization test!".repeat(100);
+        
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&original_data).unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert!(compressed.starts_with(&[0x1f, 0x8b]));
+
+        let mut decoder = GzDecoder::new(&compressed[..]);
+        let mut decompressed = Vec::new();
+        std::io::Read::read_to_end(&mut decoder, &mut decompressed).unwrap();
+        assert_eq!(decompressed, original_data);
+    }
+
     #[test]
     fn test_webdav_password_storage() {
         let temp_dir = std::env::temp_dir().join("audire_reader_sync_test");
@@ -1304,3 +1497,4 @@ mod tests {
         assert_eq!(after_delete.unwrap(), None);
     }
 }
+
