@@ -211,7 +211,7 @@ class _MobileSyncScreenState extends State<MobileSyncScreen> {
       if (mounted) {
         if (response.statusCode == 200) {
           final resData = json.decode(response.body);
-          if (resData['success'] == true) {
+          if (resData['success'] == true || resData['status'] == 'ok') {
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
                 content: Text(
