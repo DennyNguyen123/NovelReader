@@ -12,6 +12,8 @@ import 'bgm/local_bgm_provider.dart';
 import 'bgm/radio_browser_provider.dart';
 import 'bgm/open_lofi_provider.dart';
 
+enum BgmState { idle, loading, playing, paused, error }
+
 class BgmService extends ChangeNotifier {
   static BgmService? _instance;
   final ja.AudioPlayer _audioPlayer = ja.AudioPlayer();
@@ -30,7 +32,8 @@ class BgmService extends ChangeNotifier {
   int? _currentBgmTrackId;
   List<BgmTrack> _bgmPlaylist = [];
   BgmTrack? _currentTrack;
-  bool _isPlaying = false;
+  BgmState _state = BgmState.idle;
+  int _bgmSessionId = 0;
   bool _isInit = false;
   bool _hasSource = false;
 
@@ -42,7 +45,10 @@ class BgmService extends ChangeNotifier {
   int? get currentBgmTrackId => _currentBgmTrackId;
   List<BgmTrack> get bgmPlaylist => _bgmPlaylist;
   BgmTrack? get currentTrack => _currentTrack;
-  bool get isPlaying => _isPlaying;
+  bool get isPlaying => _state == BgmState.playing;
+  bool get isLoading => _state == BgmState.loading;
+  bool get isPaused => _state == BgmState.paused;
+  BgmState get state => _state;
 
   BgmService._() {
     LoggerService().log("Constructor started", tag: 'BGM');
@@ -405,6 +411,7 @@ class BgmService extends ChangeNotifier {
 
   // --- Phát nhạc ---
   Future<void> playTrack(BgmTrack track) async {
+    final sessionId = ++_bgmSessionId;
     await _audioPlayer.stop();
     _currentTrack = track;
 
@@ -416,12 +423,13 @@ class BgmService extends ChangeNotifier {
     );
 
     if (!_bgmEnabled) {
+      _state = BgmState.idle;
       notifyListeners();
       return;
     }
 
     try {
-      _isPlaying = true;
+      _state = BgmState.loading;
       notifyListeners();
 
       if (track.sourceType == 'local') {
@@ -429,7 +437,15 @@ class BgmService extends ChangeNotifier {
         final fileName = p.basename(track.sourcePath);
         final file = File(p.join(appDir.path, 'bgm', fileName));
         if (await file.exists()) {
+          if (sessionId != _bgmSessionId || !_bgmEnabled || _state != BgmState.loading) {
+            await _audioPlayer.stop();
+            return;
+          }
           await _audioPlayer.setFilePath(file.path);
+          if (sessionId != _bgmSessionId || !_bgmEnabled || _state != BgmState.loading) {
+            await _audioPlayer.stop();
+            return;
+          }
           await _audioPlayer.play();
           _hasSource = true;
         } else {
@@ -439,27 +455,43 @@ class BgmService extends ChangeNotifier {
           track.sourceType == 'openlofi' ||
           track.sourceType == 'direct_url') {
         // Stream from internet
+        if (sessionId != _bgmSessionId || !_bgmEnabled || _state != BgmState.loading) {
+          await _audioPlayer.stop();
+          return;
+        }
         await _audioPlayer.setUrl(track.sourcePath);
+        if (sessionId != _bgmSessionId || !_bgmEnabled || _state != BgmState.loading) {
+          await _audioPlayer.stop();
+          return;
+        }
         await _audioPlayer.play();
         _hasSource = true;
       } else {
         throw Exception("Unsupported BGM source type: ${track.sourceType}");
       }
 
+      if (sessionId != _bgmSessionId || !_bgmEnabled || _state != BgmState.loading) {
+        await _audioPlayer.stop();
+        return;
+      }
+
       await _audioPlayer.setVolume(_bgmVolume);
+      _state = BgmState.playing;
+      notifyListeners();
     } catch (e) {
+      if (sessionId != _bgmSessionId) return;
       LoggerService().log(
         "Error playing BGM",
         tag: 'BGM',
         level: LogLevel.error,
         error: e.toString(),
       );
-      _isPlaying = false;
+      _state = BgmState.error;
       _hasSource = false;
       notifyListeners();
 
       // Tự động Fallback sang Local nếu đang dùng Internet Provider bị lỗi
-      if (_bgmProviderId != 'local') {
+      if (_bgmProviderId != 'local' && _bgmEnabled) {
         LoggerService().log(
           "Network BGM failed, falling back to local provider...",
           tag: 'BGM',
@@ -478,7 +510,7 @@ class BgmService extends ChangeNotifier {
       await _initCompleter.future;
     }
 
-    if (!_bgmEnabled || _isPlaying) return;
+    if (!_bgmEnabled || _state == BgmState.playing || _state == BgmState.loading) return;
 
     if (_currentTrack != null) {
       if (_currentTrack!.sourceType == 'local') {
@@ -487,9 +519,14 @@ class BgmService extends ChangeNotifier {
         final file = File(p.join(appDir.path, 'bgm', fileName));
         if (await file.exists()) {
           if (_hasSource) {
-            _isPlaying = true;
-            await _audioPlayer.play();
+            final sessionId = ++_bgmSessionId;
+            _state = BgmState.playing;
             notifyListeners();
+            await _audioPlayer.play();
+            if (sessionId != _bgmSessionId || !_bgmEnabled || _state != BgmState.playing) {
+              await _audioPlayer.pause();
+              return;
+            }
           } else {
             // Lần đầu tiên phát nhạc nền, nạp nguồn âm thanh từ đầu
             await playTrack(_currentTrack!);
@@ -506,14 +543,16 @@ class BgmService extends ChangeNotifier {
   }
 
   Future<void> pauseBgm() async {
-    if (!_isPlaying) return;
-    _isPlaying = false;
+    _bgmSessionId++;
+    if (_state == BgmState.idle || _state == BgmState.paused) return;
+    _state = BgmState.paused;
     await _audioPlayer.pause();
     notifyListeners();
   }
 
   Future<void> stopBgm() async {
-    _isPlaying = false;
+    _bgmSessionId++;
+    _state = BgmState.idle;
     _hasSource = false; // Reset nguồn khi dừng hẳn nhạc
     await _audioPlayer.stop();
     notifyListeners();
@@ -554,7 +593,7 @@ class BgmService extends ChangeNotifier {
   }
 
   void _onTrackComplete() {
-    if (!_isPlaying) return;
+    if (_state != BgmState.playing) return;
 
     if (_bgmLoopMode == 'one') {
       if (_currentTrack != null) {

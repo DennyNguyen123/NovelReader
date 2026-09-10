@@ -50,6 +50,13 @@ fn emit_sync_event(event: SyncProgressEvent) {
     }
 }
 
+fn record_sync_success_timestamp() {
+    if let Ok(Some(mut settings)) = crate::api::database::get_settings() {
+        settings.web_dav_last_sync = Some(Utc::now().timestamp_millis());
+        let _ = crate::api::database::save_settings(settings);
+    }
+}
+
 // --- WebDAV Client & XML ---
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -80,8 +87,8 @@ impl WebDavClient {
         let auth_header = format!("Basic {}", auth_b64);
         
         let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(20))
-            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(std::time::Duration::from_secs(15))
             .build()
             .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
@@ -736,6 +743,7 @@ pub async fn sync_book_progress(book_uuid: String) -> Result<ProgressSyncResult,
             let json_bytes = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
             let _ = client.upload_bytes(&remote_path, json_bytes).await;
             record_book_progress_sync(&book_uuid, "push", local.current_chapter_index, local.current_paragraph_index, None);
+            record_sync_success_timestamp();
             Ok(ProgressSyncResult {
                 status: "updatedCloud".to_string(),
                 cloud_chapter_index: Some(local.current_chapter_index),
@@ -756,6 +764,7 @@ pub async fn sync_book_progress(book_uuid: String) -> Result<ProgressSyncResult,
             };
             crate::api::database::save_reading_progress(prog)?;
             record_book_progress_sync(&book_uuid, "pull", cloud.chapter_index, cloud.paragraph_index, cloud.device_name.clone());
+            record_sync_success_timestamp();
             Ok(ProgressSyncResult {
                 status: "updatedLocal".to_string(),
                 cloud_chapter_index: Some(cloud.chapter_index),
@@ -779,6 +788,7 @@ pub async fn sync_book_progress(book_uuid: String) -> Result<ProgressSyncResult,
                 let json_bytes = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
                 let _ = client.upload_bytes(&remote_path, json_bytes).await;
                 record_book_progress_sync(&book_uuid, "push", local.current_chapter_index, local.current_paragraph_index, None);
+                record_sync_success_timestamp();
                 Ok(ProgressSyncResult {
                     status: "updatedCloud".to_string(),
                     cloud_chapter_index: Some(local.current_chapter_index),
@@ -798,6 +808,7 @@ pub async fn sync_book_progress(book_uuid: String) -> Result<ProgressSyncResult,
                 };
                 crate::api::database::save_reading_progress(prog)?;
                 record_book_progress_sync(&book_uuid, "pull", cloud.chapter_index, cloud.paragraph_index, cloud.device_name.clone());
+                record_sync_success_timestamp();
                 Ok(ProgressSyncResult {
                     status: "updatedLocal".to_string(),
                     cloud_chapter_index: Some(cloud.chapter_index),
@@ -807,6 +818,7 @@ pub async fn sync_book_progress(book_uuid: String) -> Result<ProgressSyncResult,
                     message: Some("Cloud is newer, updated local".to_string()),
                 })
             } else {
+                record_sync_success_timestamp();
                 Ok(ProgressSyncResult {
                     status: "noChange".to_string(),
                     cloud_chapter_index: Some(cloud.chapter_index),
@@ -1092,6 +1104,8 @@ pub async fn sync_library(documents_dir: Option<String>) -> Result<SyncResult, S
         details: format!("Synced {} local books successfully", local_books.len()),
     });
 
+    record_sync_success_timestamp();
+
     emit_sync_event(SyncProgressEvent {
         event_type: "syncFinished".to_string(),
         book_uuid: None,
@@ -1196,6 +1210,8 @@ pub async fn force_push(progress_only: bool) -> Result<SyncResult, String> {
         details: format!("Force pushed {} books to cloud", local_books.len()),
     });
 
+    record_sync_success_timestamp();
+
     Ok(SyncResult {
         success: true,
         message: "Force push completed successfully".to_string(),
@@ -1253,6 +1269,8 @@ pub async fn force_pull(progress_only: bool, documents_dir: String) -> Result<Sy
         status: "success".to_string(),
         details: "Force pulled cloud data to local".to_string(),
     });
+
+    record_sync_success_timestamp();
 
     Ok(SyncResult {
         success: true,
@@ -1314,6 +1332,10 @@ pub async fn force_push_book(book_uuid: String) -> Result<SyncResult, String> {
         }
     }
 
+    if ok {
+        record_sync_success_timestamp();
+    }
+
     Ok(SyncResult {
         success: ok,
         message: format!("Pushed book {} to cloud", book_uuid),
@@ -1326,6 +1348,7 @@ pub async fn force_pull_book(book_uuid: String, documents_dir: String) -> Result
     let _ = sync_book_progress(book_uuid.clone()).await;
     let _ = sync_book_bookmarks(book_uuid.clone()).await;
     let _ = sync_book_highlights(book_uuid.clone()).await;
+    record_sync_success_timestamp();
     Ok(SyncResult {
         success: true,
         message: format!("Pulled book {} from cloud", book_uuid),
@@ -1376,20 +1399,13 @@ pub async fn delete_book_from_cloud(book_uuid: String) -> Result<SyncResult, Str
 }
 
 pub async fn upload_single_book(book_uuid: String) -> Result<SyncResult, String> {
-    let ok = export_and_upload_book(book_uuid.clone()).await?;
-    if ok {
-        let _ = sync_library(None).await;
-    }
-    Ok(SyncResult {
-        success: ok,
-        message: format!("Uploaded book {} to cloud", book_uuid),
-        local_changed: false,
-    })
+    force_push_book(book_uuid).await
 }
 
 pub async fn download_virtual_book(book_uuid: String, documents_dir: String) -> Result<SyncResult, String> {
     let book = download_and_import_book(book_uuid.clone(), documents_dir).await?;
     let _ = sync_book_progress(book.uuid.clone()).await;
+    record_sync_success_timestamp();
     Ok(SyncResult {
         success: true,
         message: format!("Downloaded virtual book {}", book.title),

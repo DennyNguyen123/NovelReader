@@ -166,26 +166,52 @@ class SyncService {
   }
 
   Future<SyncResult> forcePushBook(String bookUuid) async {
-    return await rust_sync.forcePushBook(bookUuid: bookUuid);
+    _updateBookSyncStatus(bookUuid, 'syncing');
+    try {
+      final result = await rust_sync.forcePushBook(bookUuid: bookUuid);
+      _updateBookSyncStatus(bookUuid, result.success ? 'success' : 'error');
+      await fetchCloudBooks();
+      return result;
+    } catch (e) {
+      _updateBookSyncStatus(bookUuid, 'error');
+      return SyncResult(success: false, message: 'Push failed: $e', localChanged: false);
+    }
   }
 
   Future<SyncResult> forcePullBook(String bookUuid) async {
-    final docDir = (await PathHelper.getAppDirectory()).path;
-    return await rust_sync.forcePullBook(bookUuid: bookUuid, documentsDir: docDir);
+    _updateBookSyncStatus(bookUuid, 'syncing');
+    try {
+      final docDir = (await PathHelper.getAppDirectory()).path;
+      final result = await rust_sync.forcePullBook(bookUuid: bookUuid, documentsDir: docDir);
+      _updateBookSyncStatus(bookUuid, result.success ? 'success' : 'error');
+      return result;
+    } catch (e) {
+      _updateBookSyncStatus(bookUuid, 'error');
+      return SyncResult(success: false, message: 'Pull failed: $e', localChanged: false);
+    }
   }
 
   Future<SyncResult> deleteBookFromCloud(String bookUuid) async {
-    final result = await rust_sync.deleteBookFromCloud(bookUuid: bookUuid);
-    await fetchCloudBooks();
-    return result;
+    try {
+      final result = await rust_sync.deleteBookFromCloud(bookUuid: bookUuid);
+      await fetchCloudBooks();
+      return result;
+    } catch (e) {
+      return SyncResult(success: false, message: 'Delete failed: $e', localChanged: false);
+    }
   }
 
   Future<SyncResult> uploadSingleBook(String bookUuid) async {
     _updateBookSyncStatus(bookUuid, 'syncing');
-    final result = await rust_sync.uploadSingleBook(bookUuid: bookUuid);
-    _updateBookSyncStatus(bookUuid, result.success ? 'success' : 'error');
-    await fetchCloudBooks();
-    return result;
+    try {
+      final result = await rust_sync.uploadSingleBook(bookUuid: bookUuid);
+      _updateBookSyncStatus(bookUuid, result.success ? 'success' : 'error');
+      await fetchCloudBooks();
+      return result;
+    } catch (e) {
+      _updateBookSyncStatus(bookUuid, 'error');
+      return SyncResult(success: false, message: 'Upload failed: $e', localChanged: false);
+    }
   }
 
   Future<SyncResult> downloadVirtualBook(String bookUuid) async {
